@@ -297,6 +297,20 @@ def load_events(user: str = None) -> pd.DataFrame:
     df['date'] = pd.to_datetime(df['date']).dt.date
     return df
 
+# Função de atualização para Quests
+def update_quest(quest_id: int, title: str, area: str, xp_reward: int, cadence: str, streak: int, user: str):
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    # Assume que o usuário só pode atualizar quests que criou (user=?) ou quests genéricas (user IS NULL),
+    # mas o teste de `user=?` é mais seguro para evitar que Marcel edite uma quest de Larissa
+    # que porventura ela tenha criado sem o escopo de usuário (se houvesse esse bug).
+    c.execute(
+        "UPDATE quests SET title=?, area=?, xp_reward=?, cadence=?, streak=? WHERE id=? AND (user=? OR user IS NULL)",
+        (title, area, xp_reward, cadence, streak, quest_id, user),
+    )
+    conn.commit()
+    conn.close()
+
 # ---------- Analytics & badges
 def aggregate_xp_by_area(df: pd.DataFrame):
     if df.empty:
@@ -776,6 +790,7 @@ else:
 st.markdown('---')
 st.header('Quests & Streaks')
 with st.expander('Criar nova quest'):
+    # ... (código do formulário 'Criar nova quest' existente)
     q_title = st.text_input('Título da quest', key=f'q_title_{current_user}')
     q_area = st.selectbox('Área', options=areas, key=f'q_area_{current_user}') 
     q_xp = st.number_input('XP recompensa', min_value=0, value=50, key=f'q_xp_{current_user}')
@@ -784,8 +799,70 @@ with st.expander('Criar nova quest'):
         add_quest(q_title, q_area, int(q_xp), cadence=q_cadence, user=current_user)
         st.success('Quest adicionada')
         safe_rerun()
+        
+# Formulário de Edição de Quests
+with st.expander('Editar Quests (por ID) / Modificar dados'):
+    quests_df_full = load_quests(user=current_user) # Recarrega todas as quests (ativas e inativas se necessário para edicao)
+    if quests_df_full.empty:
+        st.info("Nenhuma quest disponível para edição.")
+    else:
+        quest_ids = quests_df_full['id'].unique().tolist()
+        edit_quest_id = st.selectbox(
+            'ID da quest para editar', 
+            options=[None] + quest_ids, 
+            index=0, 
+            format_func=lambda x: "Selecione um ID" if x is None else str(x), 
+            key=f'edit_quest_id_{current_user}'
+        )
 
-quests_df = load_quests(user=current_user)
+        if edit_quest_id is not None:
+            current_quest = quests_df_full[quests_df_full['id'] == edit_quest_id].iloc[0]
+            
+            with st.form(f'edit_quest_form_{current_user}'):
+                
+                # Campos de edição
+                edit_q_title = st.text_input('Novo Título', value=current_quest['title'], key=f'edit_q_title_{current_user}')
+                
+                # Para a Área
+                current_q_area = current_quest['area']
+                all_areas_q = sorted(list(set(AREAS_DEFAULT + quests_df_full['area'].unique().tolist())))
+                try:
+                    current_q_area_index = all_areas_q.index(current_q_area)
+                except ValueError:
+                    all_areas_q.insert(0, current_q_area)
+                    current_q_area_index = 0
+                edit_q_area = st.selectbox('Nova Área', options=all_areas_q, index=current_q_area_index, key=f'edit_q_area_{current_user}')
+                
+                edit_q_xp = st.number_input('Novo XP Recompensa', min_value=0, value=int(current_quest['xp_reward']), key=f'edit_q_xp_{current_user}')
+                
+                # Para a Cadência
+                current_q_cadence = current_quest['cadence']
+                cadence_options = ['daily', 'weekly', 'once']
+                current_q_cadence_index = cadence_options.index(current_q_cadence) if current_q_cadence in cadence_options else 0
+                edit_q_cadence = st.selectbox('Nova Cadência', options=cadence_options, index=current_q_cadence_index, key=f'edit_q_cadence_{current_user}')
+                
+                edit_q_streak = st.number_input('Novo Streak', min_value=0, value=int(current_quest['streak']), key=f'edit_q_streak_{current_user}')
+                
+                edit_submitted = st.form_submit_button('Salvar Alterações da Quest', key=f'edit_quest_btn_{current_user}')
+                
+                if edit_submitted:
+                    try:
+                        update_quest(
+                            quest_id=int(edit_quest_id),
+                            title=edit_q_title,
+                            area=edit_q_area,
+                            xp_reward=int(edit_q_xp),
+                            cadence=edit_q_cadence,
+                            streak=int(edit_q_streak),
+                            user=current_user
+                        )
+                        st.success(f'Quest #{edit_quest_id} atualizada com sucesso!')
+                        safe_rerun()
+                    except sqlite3.OperationalError:
+                        st.error("Erro: O banco de dados está bloqueado. Por favor, tente novamente.")
+
+
+quests_df = load_quests(user=current_user) # Carrega APENAS as quests ativas para exibição
 if quests_df.empty:
     st.write('Nenhuma quest ativa.')
 else:
