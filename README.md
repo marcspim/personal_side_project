@@ -66,23 +66,64 @@ O projeto ainda está em **fase inicial**, mas já possui várias funcionalidade
 ---
 
 ### Metas (por área)
-- Metas semanais e mensais  
-- Salvas no banco (persistência automática)  
-- Barra de progresso para cada meta  
-- Suporte a múltiplas áreas personalizáveis
+
+Metas possuem **persistência própria**, **associação com eventos** e **integração automática com quests diárias**.
+
+#### Estrutura Interna
+Cada meta é armazenada na tabela `metas` com os campos:
+
+- `area` – área à qual a meta pertence  
+- `weekly_target` – XP alvo semanal  
+- `note` – descrição detalhada  
+- `daily_suggestion` – sugestão de XP diário  
+- `created_at` e `updated_at` – controles automáticos  
+- `active` – permite arquivamento sem exclusão definitiva
+
+#### Registro Automático de XP vinculado a metas
+Ao registrar um evento, você pode vinculá-lo diretamente a uma meta.  
+Esse vínculo cria uma relação `events.meta_id`, permitindo:
+
+- cálculo correto da barra de progresso  
+- métricas semanais baseadas na data de criação da meta  
+- rastreamento específico (não misturado ao XP global)
+
+#### Geração automática de Quests diárias
+Se a meta tiver `daily_suggestion > 0`, o sistema cria ou atualiza automaticamente uma **quest diária** baseada nela:
+
+- título: `Meta diária: <área>`  
+- XP recompensa: igual à sugestão diária  
+- cadência: diária  
+- streak independente
+
+Comportamento totalmente automatizado.
 
 ---
 
-### Quests & Streaks
-- Criação de quests com:
-  - Título  
-  - Área  
-  - XP recompensa  
-  - Cadência: diário / semanal / único  
-- Streak automático  
-- Registro de XP ao completar  
-- Desativação de quests  
-- Interface intuitiva para acompanhar o progresso
+### Quests, Streaks e Regras Internas
+
+As quests possuem lógica interna completa.
+
+#### Campos importantes
+
+- `cadence` — diária / semanal / única
+- `last_done` — controla streak
+- `streak` — número de dias/semana consecutivos
+- `active` — permite desativar sem excluir
+- `user` — quests específicas por usuário (ou globais via `NULL`)
+
+#### Cálculo do Streak
+
+Ao completar uma quest:
+- se a última conclusão foi ontem, o streak aumenta
+- senão, reseta para 1
+- atualiza `last_done`
+
+#### Quests globais vs. individuais
+
+Quests com `user=NULL` são consideradas globais:
+visíveis e completáveis por qualquer usuário.
+
+Quests com `user=<username>` são específicas e só aparecem para ele.
 
 ---
 
@@ -94,10 +135,95 @@ O projeto ainda está em **fase inicial**, mas já possui várias funcionalidade
 ---
 
 ### Perks (Desbloqueáveis)
-- Perks globais e específicos por usuário  
-- Requisitos de nível por área  
-- Efeitos personalizados  
-- Exibição automática de perks desbloqueados e pendentes
+
+#### Estrutura do Sistema de Perks
+A tabela `perks` possui colunas avançadas:
+
+- `multiplier` – multiplicador aplicado ao XP (ex.: 1.10, 1.20)  
+- `duration_days` – duração em dias do efeito  
+- `start_date` – quando a perk foi ativada  
+- `active` – indica se o bônus está valendo  
+- `user` – perks específicas por usuário (ou `NULL` para perks globais)
+
+#### Regras de Ativação
+Ao ativar uma perk:
+
+- `start_date` = timestamp atual  
+- `active = 1`  
+- perks expiram automaticamente ao atingir `duration_days`
+
+#### Aplicação automática de bônus de XP
+Toda vez que um evento é registrado:
+
+1. O sistema identifica perks ativas relevantes à **área** do evento.  
+2. O maior multiplicador disponível é aplicado ao XP.  
+3. A nota da atividade recebe um marcador:  
+
+`[Bônus aplicado: original X → Y XP]`
+
+Isso garante transparência total do sistema.
+
+---
+
+### Sistema de XP e Progressão de Nível
+
+A progressão de nível não é linear.  
+O app utiliza uma fórmula exponencial para calcular o XP necessário para cada nível:
+
+```python
+BASE_XP = 100
+XP_EXP = 1.45
+```
+
+#### Consequências dessa fórmula
+
+- níveis ficam progressivamente mais difíceis
+- XP exigido cresce com uma curva suave
+- o dashboard calcula:
+  - nível atual
+  - XP dentro do nível
+  - XP total para o próximo nível
+  - barra de progresso normalizada
+
+Esse comportamento é automático e transparente ao usuário final.
+
+---
+
+### Edição, Exclusão e Regras de Autorização
+
+O app possui ferramentas avançadas para manipulação de dados.
+
+#### Edição de Eventos
+
+É possível editar:
+- `data`
+- `área`
+- `XP`
+- `notas`
+
+Com atualização imediata no banco.
+
+#### Exclusão controlada
+
+Eventos podem ser removidos, mas somente quando o usuário:
+- habilita a exclusão manualmente
+- confirma a operação
+
+#### Edição e Exclusão de Metas
+
+Ao excluir uma meta:
+1. A meta é removida da tabela `metas`
+2. Quests diárias vinculadas a ela também são excluídas
+3. Configurações persistentes (`user_config`) são limpas automaticamente
+
+#### Regras de Autorização
+
+Para evitar interferência entre usuários:
+- um usuário só pode editar quests e metas pertencentes a ele
+- quests globais (`user IS NULL`) podem ser editadas, mas não modificam os dados de outro usuário
+- eventos só podem ser editados/excluídos pelo dono
+
+Esse modelo garante isolamento total dos dados pessoais.
 
 ---
 
