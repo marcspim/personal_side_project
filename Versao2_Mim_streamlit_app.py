@@ -10,6 +10,7 @@ import hashlib
 import time
 import re
 from datetime import datetime as dt, timedelta
+import io
 
 # ---------- Config
 DB_PATH = Path("versao2_mim.db")
@@ -1405,7 +1406,13 @@ else:
         st.write(f"Semana: **{w_xp}** / {weekly_target} XP  —  Mês: **{m_xp}** / {monthly_target} XP")
         # barra de progresso (protege divisão por zero)
         if weekly_target > 0:
-            st.progress(min(w_xp / max(1, weekly_target), 1.0))
+            # calcula progresso seguro em [0.0, 1.0]
+            wt = max(1, int(weekly_target))  # evita divisão por 0
+            raw_val = float(w_xp) / float(wt)  # pode ser negativo se w_xp < 0
+            if raw_val < 0:
+                st.warning(f"XP semanal negativo: {w_xp} (meta {wt}).")
+            progress_val = max(0.0, min(raw_val, 1.0))  # força intervalo [0.0, 1.0]
+            st.progress(progress_val)
             pct = round((w_xp / weekly_target) * 100, 1)
             st.write(f"{pct}% da meta semanal")
         else:
@@ -1630,49 +1637,301 @@ else:
                 except sqlite3.OperationalError:
                     st.error("Erro: O banco de dados está bloqueado. Por favor, tente novamente.")
 
-# Penalidades simples (user-scoped)
-st.markdown('---')
-st.header('Penalidades por quebra de hábito (configurar)')
+def migrate_penalties_table(path: Path = DB_PATH):
+    conn = sqlite3.connect(path, timeout=5)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS penalties (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            area TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            user TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-with st.expander('Configurar penalidades'):
+migrate_penalties_table()
+
+def migrate_penalty_applications_table(path: Path = DB_PATH):
+    conn = sqlite3.connect(path, timeout=5)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS penalty_applications (
+            id INTEGER PRIMARY KEY,
+            penalty_id INTEGER,
+            penalty_name TEXT,
+            user TEXT,
+            area TEXT,
+            amount INTEGER,
+            note TEXT,
+            applied_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(penalty_id) REFERENCES penalties(id)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+migrate_penalty_applications_table()
+
+# ---------- Funções utilitárias ----------
+def add_penalty(name: str, area: str, amount: int, user: str = None):
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    c.execute("INSERT INTO penalties (name, area, amount, user) VALUES (?, ?, ?, ?)",
+              (name, area, int(amount), user))
+    conn.commit()
+    conn.close()
+
+def load_penalties(user: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    if user:
+        df = pd.read_sql_query(
+            "SELECT * FROM penalties WHERE (user=? OR user IS NULL) ORDER BY id DESC",
+            conn, params=(user,))
+    else:
+        df = pd.read_sql_query("SELECT * FROM penalties ORDER BY id DESC", conn)
+    conn.close()
+
+    if df.empty:
+        return pd.DataFrame(columns=["id","name","area","amount","user","created_at"])
+
+    # remove duplicatas globais se existir versão do usuário com mesmo nome
+    specific = df[df["user"] == user]["name"].tolist()
+    if specific:
+        df = df[~((df["user"].isna()) & (df["name"].isin(specific)))]
+
+    return df
+
+def _penalty_last_applied_key(user: str, penalty_id: int):
+    return f"penalty_last_applied_{user}_{penalty_id}"
+
+def can_apply_penalty(user: str, penalty_id: int, block_days: int = 1):
+    key = _penalty_last_applied_key(user, penalty_id)
+    last = get_user_config(user, key, None)
+
+    if last is None or last == "None":
+        return True, ""
+
+    try:
+        last_date = date.fromisoformat(str(last))
+        if (date.today() - last_date).days >= block_days:
+            return True, ""
+        else:
+            next_allowed = last_date + timedelta(days=block_days)
+            return False, (
+                f"Você só poderá aplicar novamente em {next_allowed.isoformat()}."
+            )
+    except Exception:
+        return True, ""
+
+# ---------- Auditoria ----------
+def record_penalty_application(penalty_id: int, penalty_name: str,
+                               user: str, area: str, amount: int, note: str = ""):
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO penalty_applications
+        (penalty_id, penalty_name, user, area, amount, note, applied_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (penalty_id, penalty_name, user, area, amount, note,
+          datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+# ---------- Aplicação da penalidade ----------
+def apply_penalty(penalty_row: dict, user: str, block_days: int = 1):
+    try:
+        pid = int(penalty_row["id"])
+        name = penalty_row["name"]
+        area = penalty_row["area"]
+        amount = int(penalty_row["amount"])
+
+        allowed, msg = can_apply_penalty(user, pid, block_days)
+        if not allowed:
+            return False, msg
+
+        # evento negativo
+        add_event(date.today(), area, -abs(amount),
+                  note=f"Penalidade: {name}", type_="penalty", user=user)
+
+        # auditoria
+        record_penalty_application(pid, name, user, area,
+                                   -abs(amount),
+                                   note=f"Aplicado por {user}")
+
+        # bloquear por 1 dia
+        set_user_config(
+            user,
+            _penalty_last_applied_key(user, pid),
+            date.today().isoformat()
+        )
+
+        return True, f"Penalidade '{name}' aplicada: -{amount} XP."
+    except Exception as e:
+        return False, f"Erro ao aplicar penalidade: {e}"
+
+# ------------------ Penalidades (com criação, aplicação e histórico) ------------------
+
+st.markdown('---')
+st.header('Penalidades por quebra de hábito')
+
+# 1) Painel: penalidade automática (missed daily) — conserva o comportamento existente
+with st.expander('Configurar penalidades automáticas'):
     default_penalize_str = get_user_config(current_user, 'penalty_active', 'False')
     default_penalize = default_penalize_str.lower() == 'true'
     default_penalty_amount = int(get_user_config(current_user, 'penalty_amount', 10))
-    
+
     penalize_key = f'penalize_{current_user}'
     penalty_amount_key = f'penalty_{current_user}'
-    
+
     penalize = st.checkbox(
-        'Ativar penalidades automáticas (missed daily => -XP)', 
-        value=default_penalize, 
+        'Ativar penalidades automáticas (missed daily => -XP)',
+        value=default_penalize,
         key=penalize_key,
         on_change=lambda: set_user_config(current_user, 'penalty_active', st.session_state[penalize_key])
     )
-    
+
     penalty_amount = st.number_input(
-        'XP a subtrair por falta', 
-        min_value=0, 
-        value=default_penalty_amount, 
+        'XP a subtrair por falta (automática)',
+        min_value=0,
+        value=default_penalty_amount,
         key=penalty_amount_key,
         on_change=lambda: set_user_config(current_user, 'penalty_amount', st.session_state[penalty_amount_key])
     )
 
-if penalize and not quests_df.empty:
+# Executa a penalidade automática (se ativada)
+if penalize and 'quests_df' in globals() and not quests_df.empty:
     today = date.today()
     conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     for _, q in quests_df.iterrows():
-        if q['cadence'] == 'daily' and q['last_done']:
+        if q['cadence'] == 'daily':
             try:
-                last = datetime.fromisoformat(q['last_done']).date()
-                if (today - last).days > 1:
-                    new_streak = max(0, int(q['streak']) - ((today - last).days - 1))
-                    c.execute('UPDATE quests SET streak=? WHERE id=?', (new_streak, int(q['id'])))
-                    add_event(today, q['area'], -int(penalty_amount), note=f'Penalty: missed {q["title"]}', type_='penalty', user=current_user)
+                last_done = q['last_done']
+                if last_done:
+                    last = datetime.fromisoformat(last_done).date()
+                    if (today - last).days > 1:
+                        new_streak = max(0, int(q['streak']) - ((today - last).days - 1))
+                        c.execute('UPDATE quests SET streak=? WHERE id=?', (new_streak, int(q['id'])))
+                        # grava evento negativo
+                        add_event(today, q['area'], -int(penalty_amount),
+                                  note=f'Penalty automática: missed {q["title"]}', type_='penalty', user=current_user)
             except Exception:
                 continue
     conn.commit()
     conn.close()
+
+st.markdown('---')
+
+# 2) Painel: criar penalidade customizada (user-scoped)
+with st.expander('Criar nova penalidade (personalizada)'):
+    p_name = st.text_input('Nome da penalidade (ex: Falta - Casa)', key=f'pen_name_{current_user}')
+    p_area = st.selectbox('Área afetada', options=available_areas_for_main, index=max(0, available_areas_for_main.index('Casa') if 'Casa' in available_areas_for_main else 0), key=f'pen_area_{current_user}')
+    p_amount = st.number_input('XP a subtrair por aplicação', min_value=0, value=10, key=f'pen_amount_{current_user}')
+    if st.button('Salvar penalidade', key=f'save_pen_{current_user}') and p_name:
+        try:
+            add_penalty(p_name.strip(), p_area.strip(), int(p_amount), user=current_user)
+            st.success('Penalidade criada.')
+            safe_rerun()
+        except Exception as e:
+            st.error(f'Erro ao criar penalidade: {e}')
+
+# 3) Lista de penalidades e UI de aplicar
+st.subheader('Penalidades disponíveis (globais + minhas)')
+pens_df = load_penalties(user=current_user)
+
+if pens_df is None or pens_df.empty:
+    st.info('Nenhuma penalidade cadastrada. Crie uma no painel acima.')
+else:
+    for _, prow in pens_df.iterrows():
+        p = prow.to_dict()
+        cols = st.columns([3,1,1])
+        with cols[0]:
+            st.write(f"**{p['name']}** — Área: {p['area']} — XP: {p['amount']}")
+            if p.get('user'):
+                st.caption(f"Personal — owner: {p['user']}")
+            else:
+                st.caption("Global")
+        with cols[1]:
+            # verifica bloqueio (1 dia) por aplicação
+            allowed, msg = can_apply_penalty(current_user, int(p['id']), block_days=1)
+            apply_key = f"apply_pen_{current_user}_{int(p['id'])}"
+            if allowed:
+                if st.button(f"Aplicar {p['name']}", key=apply_key):
+                    ok, message = apply_penalty(p, user=current_user, block_days=1)
+                    if ok:
+                        st.success(message)
+                        safe_rerun()
+                    else:
+                        st.error(message)
+            else:
+                st.button("Aplicar (bloqueado)", key=apply_key + "_blocked")
+                st.warning(msg)
+        with cols[2]:
+            # permitir exclusão apenas para penalidades do próprio usuário
+            if p.get('user') == current_user:
+                if st.button("Excluir", key=f"del_pen_{current_user}_{int(p['id'])}"):
+                    try:
+                        conn = sqlite3.connect(DB_PATH, timeout=5)
+                        c = conn.cursor()
+                        c.execute("DELETE FROM penalties WHERE id=? AND user=?", (int(p['id']), current_user))
+                        conn.commit()
+                        conn.close()
+                        st.success("Penalidade excluída.")
+                        safe_rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao excluir: {e}")
+            else:
+                st.write("")
+
+st.markdown('---')
+
+# 4) Histórico de aplicações (auditoria) — mantém a UI que você já tem
+st.subheader('Histórico de aplicações de penalidades (auditoria)')
+
+all_pens_df = load_penalties(user=None)  # carrega todas (globais + pessoais)
+penalty_options = ["(Todos)"] + [f"{int(r['id'])} - {r['name']}" for _, r in all_pens_df.iterrows()]
+
+colf1, colf2, colf3 = st.columns([3,2,2])
+with colf1:
+    chosen_penalty = st.selectbox("Filtrar por penalidade", options=penalty_options, index=0)
+with colf2:
+    date_from = st.date_input("De", value=(date.today() - timedelta(days=30)))
+with colf3:
+    date_to = st.date_input("Até", value=date.today())
+
+user_filter = st.text_input("Filtrar por usuário (ex: seu usuário) - vazio para todos", value="")
+
+if st.button("Carregar histórico"):
+    q = "SELECT * FROM penalty_applications WHERE DATE(applied_at) BETWEEN ? AND ?"
+    params = [date_from.isoformat(), date_to.isoformat()]
+    if chosen_penalty and chosen_penalty != "(Todos)":
+        pid = int(chosen_penalty.split(" - ")[0])
+        q += " AND penalty_id = ?"
+        params.append(pid)
+    if user_filter.strip():
+        q += " AND user LIKE ?"
+        params.append(f"%{user_filter.strip()}%")
+
+    conn = sqlite3.connect(DB_PATH)
+    df_hist = pd.read_sql_query(q + " ORDER BY applied_at DESC", conn, params=params)
+    conn.close()
+
+    if df_hist.empty:
+        st.info("Nenhum registro encontrado para os filtros selecionados.")
+    else:
+        df_hist['applied_at'] = pd.to_datetime(df_hist['applied_at'])
+        st.write(f"Mostrando {len(df_hist)} registros")
+        st.dataframe(df_hist)
+        csv_buf = io.StringIO()
+        df_hist.to_csv(csv_buf, index=False)
+        csv_bytes = csv_buf.getvalue().encode('utf-8')
+        st.download_button("Exportar CSV do histórico", data=csv_bytes, file_name="penalty_applications_history.csv", mime="text/csv")
+
+st.caption("A aplicação de penalidades cria eventos negativos (tipo 'penalty') e grava auditoria em penalty_applications.")
 
 # --- PAINEL: Níveis por área (mostra XP e Level por área)
 area_totals = compute_area_xp_totals(user=current_user)
