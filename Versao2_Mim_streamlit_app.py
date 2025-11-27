@@ -8,6 +8,8 @@ import sqlite3
 from pathlib import Path
 import hashlib
 import time
+import re
+from datetime import datetime as dt, timedelta
 
 # ---------- Config
 DB_PATH = Path("versao2_mim.db")
@@ -102,37 +104,149 @@ def init_db(path: Path = DB_PATH):
     conn.close()
 
 def init_db_extra(path: Path = DB_PATH):
+    """
+    Inicializa/garante tabelas auxiliares (quests, perks, metas).
+    Implementado com context manager para evitar 'closed database' e com tratamento de erro.
+    """
+    try:
+        with sqlite3.connect(path, timeout=5) as conn:
+            c = conn.cursor()
+
+            # --- Quests
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS quests (
+                    id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    area TEXT NOT NULL,
+                    xp_reward INTEGER NOT NULL,
+                    cadence TEXT,
+                    last_done TEXT,
+                    streak INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1,
+                    user TEXT
+                )
+                """
+            )
+
+            # --- Perks (schema com colunas novas já previstas)
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS perks (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    area TEXT,
+                    unlock_level INTEGER NOT NULL,
+                    effect TEXT,
+                    duration_days INTEGER DEFAULT 0,
+                    multiplier REAL DEFAULT 1.0,
+                    start_date TEXT,
+                    active INTEGER DEFAULT 0,
+                    user TEXT
+                )
+                """
+            )
+
+            # --- Metas (opcional)
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metas (
+                    id INTEGER PRIMARY KEY,
+                    area TEXT NOT NULL,
+                    weekly_target INTEGER NOT NULL,
+                    note TEXT,
+                    daily_suggestion INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1,
+                    user TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT
+                )
+                """
+            )
+
+            # commit implícito ao sair do `with` (mas chamar explicitamente não faz mal)
+            conn.commit()
+
+    except Exception as e:
+        # Log simples para debug — você pode trocar por st.error / logging
+        print(f"ERRO init_db_extra(): {e}")
+        # relança para que o erro apareça se você prefere falhar fast
+        raise
+
+def migrate_perks_table(path: Path = DB_PATH):
+    """
+    Garante que a tabela perks tenha as colunas necessárias (adiciona com ALTER TABLE se faltarem).
+    Executar no startup para compatibilidade com DBs antigos.
+    """
     conn = sqlite3.connect(path, timeout=5)
     c = conn.cursor()
+    # Descobre colunas existentes
+    c.execute("PRAGMA table_info(perks)")
+    cols = [r[1] for r in c.fetchall()]
+    # Map of desired columns with SQL to add
+    adds = []
+    if 'duration_days' not in cols:
+        adds.append("ALTER TABLE perks ADD COLUMN duration_days INTEGER DEFAULT 0")
+    if 'multiplier' not in cols:
+        adds.append("ALTER TABLE perks ADD COLUMN multiplier REAL DEFAULT 1.0")
+    if 'start_date' not in cols:
+        adds.append("ALTER TABLE perks ADD COLUMN start_date TEXT")
+    if 'active' not in cols:
+        adds.append("ALTER TABLE perks ADD COLUMN active INTEGER DEFAULT 0")
+    for a in adds:
+        try:
+            c.execute(a)
+        except Exception:
+            # ignore if already exists or incompatible (best-effort)
+            pass
+    conn.commit()
+    conn.close()
+
+# run migration at startup
+migrate_perks_table()
+
+def migrate_meta_table(path: Path = DB_PATH):
+    """
+    Garante que exista a tabela 'metas' e cria se não existir.
+    Executar no startup para compatibilidade com DBs antigos.
+    """
+    conn = sqlite3.connect(path, timeout=5)
+    c = conn.cursor()
+    # cria tabela se não existir
     c.execute(
         """
-        CREATE TABLE IF NOT EXISTS quests (
+        CREATE TABLE IF NOT EXISTS metas (
             id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
             area TEXT NOT NULL,
-            xp_reward INTEGER NOT NULL,
-            cadence TEXT,
-            last_done TEXT,
-            streak INTEGER DEFAULT 0,
+            weekly_target INTEGER NOT NULL,
+            note TEXT,
+            daily_suggestion INTEGER DEFAULT 0,
             active INTEGER DEFAULT 1,
-            user TEXT
-        )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS perks (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            area TEXT,
-            unlock_level INTEGER NOT NULL,
-            effect TEXT,
-            user TEXT
+            user TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT
         )
         """
     )
     conn.commit()
     conn.close()
+
+# execute migration no startup
+migrate_meta_table()
+
+def migrate_events_table(path: Path = DB_PATH):
+    conn = sqlite3.connect(path, timeout=5)
+    c = conn.cursor()
+    # Verifica se coluna meta_id já existe
+    c.execute("PRAGMA table_info(events)")
+    cols = [r[1] for r in c.fetchall()]
+    if 'meta_id' not in cols:
+        c.execute("ALTER TABLE events ADD COLUMN meta_id INTEGER")
+    conn.commit()
+    conn.close()
+
+# chame no startup
+migrate_events_table()
 
 def init_users(path: Path = DB_PATH):
     conn = sqlite3.connect(path, timeout=5)
@@ -182,6 +296,8 @@ init_db()
 init_db_extra()
 init_users()
 init_config_db()
+migrate_events_table()
+migrate_meta_table()
 
 # ---------- CONFIG HELPERS: Configuração persistente
 def get_user_config(user: str, key: str, default=None) -> str:
@@ -265,12 +381,16 @@ def create_default_users():
 create_default_users()
 
 # ---------- Basic CRUD helpers (user-aware)
-def add_event(event_date: date, area: str, xp: int, note: str = "", type_: str = "manual", user: str = None):
-    conn = sqlite3.connect(DB_PATH, timeout=5) 
+def add_event(event_date: date, area: str, xp: int, note: str = "", type_: str = "manual", user: str = None, meta_id: int = None):
+    eff_xp = apply_perks_to_xp(area, user, xp)
+    note_final = note or ""
+    if eff_xp != xp:
+        note_final = f"{note_final} [Bônus aplicado: original {xp} -> {eff_xp} XP]" if note_final else f"[Bônus aplicado: original {xp} -> {eff_xp} XP]"
+    conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
     c.execute(
-        "INSERT INTO events (date, area, xp, note, type, user) VALUES (?, ?, ?, ?, ?, ?)",
-        (event_date.isoformat(), area, xp, note, type_, user),
+        "INSERT INTO events (date, area, xp, note, type, user, meta_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (event_date.isoformat(), area, int(eff_xp), note_final, type_, user, int(meta_id) if meta_id is not None else None),
     )
     conn.commit()
     conn.close()
@@ -392,12 +512,175 @@ def complete_quest(quest_id: int, user: str = None):
     add_event(date.today(), area, xp_reward, note=f"Quest: {title}", type_='quest', user=user)
     return True
 
-def add_perk(name: str, area: str, unlock_level: int, effect: str, user: str = None):
+def add_perk(name: str, area: str = None, unlock_level: int = 0, effect: str = "", user: str = None,
+             duration_days: int = 0, multiplier: float = 1.0, active: int = 0):
+    """
+    Insere uma perk. Garante que os campos duration_days e multiplier sejam salvos.
+    Use apenas para inserir novas linhas.
+    """
     conn = sqlite3.connect(DB_PATH, timeout=5)
     c = conn.cursor()
-    c.execute("INSERT INTO perks (name, area, unlock_level, effect, user) VALUES (?, ?, ?, ?, ?)", (name, area, unlock_level, effect, user))
+    # garante colunas existem (migração defensiva)
+    c.execute("PRAGMA table_info(perks)")
+    cols = [r[1] for r in c.fetchall()]
+    if 'multiplier' not in cols:
+        c.execute("ALTER TABLE perks ADD COLUMN multiplier REAL DEFAULT 1.0")
+    if 'duration_days' not in cols:
+        c.execute("ALTER TABLE perks ADD COLUMN duration_days INTEGER DEFAULT 0")
+    # Insere explicitamente todas as colunas
+    c.execute(
+        """INSERT INTO perks (name, area, unlock_level, effect, user, duration_days, multiplier, start_date, active)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (name, area, int(unlock_level), effect, user, int(duration_days), float(multiplier), None, int(active))
+    )
     conn.commit()
     conn.close()
+
+def seed_default_perks():
+    """
+    Insere/atualiza perks padrões declaradas no código. Faz upsert:
+    - Se já existir perk com mesmo name+area+user -> atualiza multiplier/duration_days/effect (mantendo start_date/active).
+    - Caso contrário -> insere nova.
+    """
+    defaults = [
+        {'name': 'Focus Booster', 'area': 'Produtividade', 'unlock_level': 3, 'effect': '10% XP bonus para tarefas de produtividade', 'user': None, 'duration_days': 3, 'multiplier': 1.10},
+        {'name': 'Deep Work', 'area': 'Coding', 'unlock_level': 5, 'effect': 'XP x1.2 em Coding por 7 dias', 'user': 'marcel.pimenta', 'duration_days': 7, 'multiplier': 1.20},
+        {'name': 'Deep Work', 'area': 'Educação/Inglês/Produtividade', 'unlock_level': 5, 'effect': 'XP x1.2 em Educação, Inglês e Produtividade por 7 dias', 'user': 'larissa.souza', 'duration_days': 7, 'multiplier': 1.20},
+    ]
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    for p in defaults:
+        # procura por match exato name+area+user (user pode ser NULL)
+        if p['user'] is None:
+            c.execute("SELECT id FROM perks WHERE name=? AND area=? AND user IS NULL", (p['name'], p['area']))
+        else:
+            c.execute("SELECT id FROM perks WHERE name=? AND area=? AND user=?", (p['name'], p['area'], p['user']))
+        res = c.fetchone()
+        if res:
+            pid = res[0]
+            # atualiza multiplicador, duration e effect se diferente (não altera start_date/active)
+            c.execute(
+                "UPDATE perks SET unlock_level=?, effect=?, duration_days=?, multiplier=? WHERE id=?",
+                (int(p['unlock_level']), p['effect'], int(p['duration_days']), float(p['multiplier']), int(pid))
+            )
+        else:
+            # insere
+            c.execute(
+                "INSERT INTO perks (name, area, unlock_level, effect, user, duration_days, multiplier, start_date, active) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (p['name'], p['area'], int(p['unlock_level']), p['effect'], p['user'], int(p['duration_days']), float(p['multiplier']), None, 0)
+            )
+    conn.commit()
+    conn.close()
+
+seed_default_perks()
+
+def activate_perk(perk_id: int, user: str = None):
+    """Ativa a perk (grava start_date = agora e active=1)."""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    now_iso = datetime.now().isoformat()
+    # garante que a linha corresponde ao usuário ou seja global
+    c.execute("UPDATE perks SET start_date=?, active=1 WHERE id=? AND (user=? OR user IS NULL)", (now_iso, perk_id, user))
+    conn.commit()
+    conn.close()
+
+def deactivate_perk(perk_id: int, user: str = None):
+    """Desativa a perk (active=0)."""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    c.execute("UPDATE perks SET active=0, start_date=NULL WHERE id=? AND (user=? OR user IS NULL)", (perk_id, user))
+    conn.commit()
+    conn.close()
+
+def get_active_perks(user: str = None):
+    """
+    Retorna DataFrame com perks cujo active=1 e que ainda estão dentro do período duration_days (se duration_days>0).
+    Aceita perks globais (user IS NULL) e perks do usuário.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    if user:
+        df = pd.read_sql_query("SELECT * FROM perks WHERE (user=? OR user IS NULL) AND active=1", conn, params=(user,), parse_dates=["start_date"])
+    else:
+        df = pd.read_sql_query("SELECT * FROM perks WHERE active=1", conn, parse_dates=["start_date"])
+    conn.close()
+    if df.empty:
+        return pd.DataFrame()
+    # Filtra por duração: se duration_days>0 e start_date definida, verifica se ainda está ativa
+    def still_active(row):
+        try:
+            dur = int(row.get('duration_days') or 0)
+            if dur <= 0:
+                return True
+            sd = row.get('start_date')
+            if not sd:
+                # Se active=1 mas sem start_date, considera ativa (mas warn)
+                return True
+            sd_date = pd.to_datetime(sd).date() if isinstance(sd, str) else pd.to_datetime(sd).date()
+            # ainda ativa se dias passados < dur
+            return (date.today() - sd_date).days < dur
+        except Exception:
+            return True
+    df['is_active_now'] = df.apply(still_active, axis=1)
+    df = df[df['is_active_now']]
+    return df
+
+def apply_perks_to_xp(area: str, user: str, xp: int) -> int:
+    """
+    Aplica perks ativas que influenciem a area.
+    Estratégia:
+      - considera perks ativas do user e globais (get_active_perks)
+      - faz comparação por *contains* (case-insensitive) para cobrir 'Produtividade' e 'Produtividade/Outros'
+      - aplica o maior multiplicador encontrado (evita stacking indesejado)
+    """
+    df = get_active_perks(user=user)
+    if df.empty:
+        return xp
+    candidates = []
+    a_norm = (area or "").strip().lower()
+    for _, r in df.iterrows():
+        r_area = str(r.get('area') or "").strip().lower()
+        # se r_area vazio => aplica a todas as áreas
+        if not r_area:
+            candidates.append(r)
+            continue
+        # se r_area lista separada por '/', verificar contains em qualquer segmento
+        parts = [p.strip() for p in r_area.split('/')]
+        for p in parts:
+            if p and (p == a_norm or p in a_norm or a_norm in p):
+                candidates.append(r)
+                break
+    if not candidates:
+        return xp
+    # pega maior multiplicador
+    best = max(candidates, key=lambda rr: float(rr.get('multiplier') or 1.0))
+    mult = float(best.get('multiplier') or 1.0)
+    new_xp = int(round(xp * mult))
+    return new_xp
+
+def perk_time_remaining(row) -> str:
+    """
+    Retorna string com tempo restante, em dias/hours, para um perk com start_date/duration_days.
+    """
+    try:
+        sd = row.get('start_date')
+        dur = int(row.get('duration_days', 0) or 0)
+        if dur <= 0:
+            return "Ilimitado"
+        if not sd:
+            return f"{dur} dias (não ativada)"
+        sd_date = pd.to_datetime(sd).to_pydatetime()
+        end_dt = sd_date + timedelta(days=dur)
+        rem = end_dt - datetime.now()
+        if rem.total_seconds() <= 0:
+            return "Expirada"
+        days = rem.days
+        hours = rem.seconds // 3600
+        if days > 0:
+            return f"{days}d {hours}h"
+        else:
+            return f"{hours}h"
+    except Exception:
+        return "Desconhecido"
 
 def load_perks(user: str = None):
     conn = sqlite3.connect(DB_PATH)
@@ -441,31 +724,205 @@ if not marcel_perk_exists or not larissa_perk_exists:
     conn_del.close()
 
     # 2. Insere a versão Focus Booster genérica (útil para ambos e baseada em uma área comum)
+    # Level 3 perks agora têm critério temporal de 3 dias por padrão com multiplier 1.10
     add_perk(
-        'Focus Booster', 
-        'Produtividade', 
-        3, 
-        '10% XP bonus para tarefas de produtividade', 
-        user=None
+        'Focus Booster',
+        'Produtividade',
+        3,
+        '10% XP bonus para tarefas de produtividade',
+        user=None,
+        duration_days=3,
+        multiplier=1.10,
+        active=0
     )
 
-    # 3. Insere a versão Deep Work EXCLUSIVA para Marcel (Coding)
+    # 3. Insere a versão Deep Work EXCLUSIVA para Marcel (Coding) - duration 7 dias
     add_perk(
-        'Deep Work', 
-        'Coding', 
-        5, 
-        'XP x1.2 em Coding por 7 dias', 
-        user='marcel.pimenta'
+        'Deep Work',
+        'Coding',
+        5,
+        'XP x1.2 em Coding por 7 dias',
+        user='marcel.pimenta',
+        duration_days=7,
+        multiplier=1.20,
+        active=0
     )
 
-    # 4. Insere a versão Deep Work EXCLUSIVA para Larissa (Educação, Inglês, Produtividade)
+    # 4. Insere a versão Deep Work EXCLUSIVA para Larissa (Educação, Inglês, Produtividade) - duration 7 dias
     add_perk(
-        'Deep Work', 
-        'Educação/Inglês/Produtividade', # Áreas listadas no campo Area para exibição
-        5, 
-        'XP x1.2 em Educação, Inglês e Produtividade por 7 dias', 
-        user='larissa.souza'
+        'Deep Work',
+        'Educação/Inglês/Produtividade',
+        5,
+        'XP x1.2 em Educação, Inglês e Produtividade por 7 dias',
+        user='larissa.souza',
+        duration_days=7,
+        multiplier=1.20,
+        active=0
     )
+
+def set_meta(area: str, weekly_target: int, note: str = "", daily_suggestion: int = 0, user: str = None, meta_id: int = None):
+    """
+    Cria ou atualiza uma meta. Ao criar, grava created_at.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    now_iso = datetime.now().isoformat()
+    if meta_id:
+        c.execute(
+            "UPDATE metas SET area=?, weekly_target=?, note=?, daily_suggestion=?, updated_at=? , user=?, active=1 WHERE id=?",
+            (area, int(weekly_target), note, int(daily_suggestion), now_iso, user, int(meta_id))
+        )
+    else:
+        c.execute(
+            "INSERT INTO metas (area, weekly_target, note, daily_suggestion, active, user, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (area, int(weekly_target), note, int(daily_suggestion), 1, user, now_iso, now_iso)
+        )
+    conn.commit()
+    conn.close()
+
+def get_meta(meta_id: int, user: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    if user:
+        df = pd.read_sql_query("SELECT * FROM metas WHERE id=? AND (user=? OR user IS NULL)", conn, params=(meta_id, user))
+    else:
+        df = pd.read_sql_query("SELECT * FROM metas WHERE id=?", conn, params=(meta_id,))
+    conn.close()
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+def get_metas_for_user(user: str = None):
+    conn = sqlite3.connect(DB_PATH)
+    if user:
+        df = pd.read_sql_query("SELECT * FROM metas WHERE (user=? OR user IS NULL) ORDER BY id DESC", conn, params=(user,))
+    else:
+        df = pd.read_sql_query("SELECT * FROM metas ORDER BY id DESC", conn)
+    conn.close()
+    return df
+
+def week_start_end_for_date(d: date):
+    """
+    Retorna (start_date, end_date) da semana corrente em que d está, com start = Monday.
+    end_date é inclusive (domingo).
+    """
+    start = d - timedelta(days=d.weekday())  # Monday
+    end = start + timedelta(days=6)
+    return start, end
+
+def compute_week_progress_for_meta(meta_row: dict) -> dict:
+    """
+    Para metas específicas: soma apenas eventos com events.meta_id == meta.id,
+    entre created_at e created_at+6 dias (ou até hoje).
+    """
+    meta_id = int(meta_row['id'])
+    weekly_target = int(meta_row['weekly_target'])
+    created_at_str = meta_row.get('created_at') or meta_row.get('created') or None
+    today = date.today()
+
+    if created_at_str:
+        try:
+            start = pd.to_datetime(created_at_str).date()
+        except Exception:
+            start = today
+    else:
+        start = today
+
+    end = start + timedelta(days=6)
+    effective_end = min(end, today)
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "SELECT SUM(xp) FROM events WHERE meta_id=? AND (user=? OR user IS NULL) AND date BETWEEN ? AND ?",
+        (meta_id, meta_row.get('user'), start.isoformat(), effective_end.isoformat())
+    )
+    row = c.fetchone()
+    accumulated = int(row[0] or 0)
+    conn.close()
+
+    percent = (accumulated / weekly_target) * 100 if weekly_target > 0 else 0.0
+    return {
+        'accumulated_xp': accumulated,
+        'weekly_target': weekly_target,
+        'percent': round(percent, 1),
+        'start_date': start,
+        'end_date': end
+    }
+
+def create_or_update_daily_quest_from_meta(meta_row: dict):
+    """
+    Se meta_row.daily_suggestion > 0, cria ou atualiza uma quest diária com title 'Meta: <area> - diária' e xp_reward = daily_suggestion.
+    Retorna quest_id.
+    """
+    ds = int(meta_row.get('daily_suggestion') or 0)
+    if ds <= 0:
+        return None
+    title = f"Meta diária: {meta_row['area']}"
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    c = conn.cursor()
+    # procura quest existente com mesmo título e user
+    c.execute("SELECT id FROM quests WHERE title=? AND (user=? OR user IS NULL)", (title, meta_row.get('user')))
+    res = c.fetchone()
+    now_iso = datetime.now().isoformat()
+    if res:
+        qid = res[0]
+        c.execute("UPDATE quests SET xp_reward=?, cadence='daily', last_done=NULL, active=1 WHERE id=?", (ds, qid))
+    else:
+        c.execute("INSERT INTO quests (title, area, xp_reward, cadence, last_done, streak, active, user) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (title, meta_row['area'], ds, 'daily', None, 0, 1, meta_row.get('user')))
+        qid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return qid
+
+# Callback para iniciar edição — executa antes da rerun final
+def start_meta_edit(area, note, weekly, daily, meta_id):
+    """
+    Callback executado quando o usuário clica em 'Editar'.
+    Define valores iniciais em st.session_state para que os widgets exibam os valores no próximo rerun.
+    Observação: não chama st.experimental_rerun() para compatibilidade com versões de Streamlit.
+    """
+    st.session_state["meta_area_input"] = area
+    st.session_state["meta_note_input"] = note or ""
+    st.session_state["meta_weekly_input"] = int(weekly)
+    st.session_state["meta_daily_input"] = int(daily or 0)
+    st.session_state["editing_meta_id"] = int(meta_id)
+    # NÃO chamar st.experimental_rerun() (nem st.experimental_rerun em try/except).
+    # O callback on_click é executado no momento apropriado do ciclo de rerun
+    # e, assim que o Streamlit rerun ocorrer, os widgets usarão os valores acima.
+    return
+
+def compute_area_xp_totals(user: str = None):
+    """
+    Retorna dict {area: total_xp} somando todos eventos dessa área.
+    Por padrão inclui todos os eventos (incluindo os vinculados a metas).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if user:
+        c.execute("SELECT area, SUM(xp) FROM events WHERE (user=? OR user IS NULL) GROUP BY area", (user,))
+    else:
+        c.execute("SELECT area, SUM(xp) FROM events GROUP BY area")
+    rows = c.fetchall()
+    conn.close()
+    return {r[0]: int(r[1] or 0) for r in rows}
+
+def level_from_xp(xp: int) -> int:
+    """
+    Função de exemplo: converte XP acumulado para level.
+    Ajuste conforme sua tabela de XP->level real.
+    Ex.: level n exige 100 * n XP acumulado cumulativo (exponha se tiver sua própria).
+    """
+    if xp < 100:
+        return 1
+    # exemplo simples: cada 200 xp = +1 level a partir de 1
+    lvl = 1
+    threshold = 100
+    while xp >= threshold:
+        xp -= threshold
+        lvl += 1
+        threshold = int(threshold * 1.5)  # opcional: incremento crescente
+    return lvl
 
 # ---------- Auth helpers
 def get_user_by_username(username: str):
@@ -603,22 +1060,62 @@ col1, col2, col3 = st.columns([3, 2, 2])
 with col1:
     with st.form(f'add_event_form_{current_user}'):
         ev_date = st.date_input('Data', value=date.today(), key=f'ev_date_{current_user}')
-        ev_area = st.selectbox('Área', options=available_areas_for_main, key=f'ev_area_{current_user}') 
+        ev_area = st.selectbox('Área', options=available_areas_for_main, key=f'ev_area_{current_user}')
         ev_xp = st.number_input('XP ganho', min_value=0, value=20, key=f'ev_xp_{current_user}')
         ev_note = st.text_area('Nota (opcional)', key=f'ev_note_{current_user}')
+
+        # --- select de metas do usuário (opcional)
+        metas_for_user = get_metas_for_user(user=current_user)
+        meta_options = [None]
+        meta_map = {None: None}
+        if metas_for_user is not None and not metas_for_user.empty:
+            for _, mm in metas_for_user.iterrows():
+                mrow = mm.to_dict()
+                label = f"{mrow['area']} — {mrow['weekly_target']} XP (id {mrow['id']})"
+                meta_options.append(label)
+                meta_map[label] = int(mrow['id'])
+
+        selected_meta_label = st.selectbox("Atribuir esta atividade a uma meta (opcional)", options=meta_options, index=0, key=f'ev_meta_sel_{current_user}')
+        assign_to_meta = False
+        selected_meta_id = None
+        if selected_meta_label and meta_map.get(selected_meta_label):
+            # confirma com checkbox (redundante, mas evita cliques acidentais)
+            assign_to_meta = st.checkbox("Confirmar: registrar esta atividade para a meta selecionada", key=f'confirm_meta_assign_{current_user}')
+            if assign_to_meta:
+                selected_meta_id = meta_map[selected_meta_label]
+
         submitted = st.form_submit_button('Registrar XP', key=f'ev_submit_{current_user}')
         if submitted:
-            add_event(ev_date, ev_area, int(ev_xp), ev_note, user=current_user)
-            st.success(f'Registrado: {ev_xp} XP em {ev_area} em {ev_date} (usuário: {current_user})')
-            safe_rerun()
+            # se assign_to_meta e selected_meta_id foram escolhidos, grava com meta_id
+            try:
+                add_event(ev_date, ev_area, int(ev_xp), ev_note, user=current_user, meta_id=selected_meta_id)
+                if selected_meta_id:
+                    st.success(f'Registrado: {ev_xp} XP em {ev_area} vinculado à meta id {selected_meta_id}')
+                else:
+                    st.success(f'Registrado: {ev_xp} XP em {ev_area} (sem meta)')
+                safe_rerun()
+            except Exception as e:
+                st.error(f"Erro ao registrar evento: {e}")
 
 with col2:
     st.subheader('Snapshot Rápido')
     df = load_events(user=current_user)
     total_xp = int(df['xp'].sum()) if not df.empty else 0
     lvl, xp_curr, xp_next, pct = xp_progress_in_level(total_xp)
+
+    # métrica de nível
     st.metric('Nível atual', f"{lvl}")
-    st.progress(pct)
+
+    # --- garante que o valor passado ao st.progress esteja entre 0 e 1 ---
+    try:
+        safe_pct = float(pct)
+    except Exception:
+        safe_pct = 0.0
+
+    safe_pct = max(0.0, min(safe_pct, 1.0))  # clamp [0, 1]
+    st.progress(safe_pct)
+    # ---------------------------------------------------------------------------
+
     st.write(f"XP total: {total_xp} ( {xp_curr}/{xp_next} para nível {lvl+1} )")
 
 with col3:
@@ -668,31 +1165,217 @@ else:
 # Goals (user-scoped)
 st.header('Metas & tarefas')
 goals = {}
+
+# evita chaves com 'None' no nome caso current_user seja None
+user_keyname = current_user or "guest"
+
 with st.expander('Configurar metas (por área)'):
-    for a in areas: 
+    for a in areas:
+        # lê defaults do user_config (se existir), senão usa valores padrão
         default_w = int(get_user_config(current_user, f'goal_weekly_{a}', 100))
         default_m = int(get_user_config(current_user, f'goal_monthly_{a}', 400))
-        
-        w_key = f'goal_w_{current_user}_{a}'
-        m_key = f'goal_m_{current_user}_{a}'
-        
-        st.markdown(f"**{a}**")
-        w = st.number_input(
-            'Meta semanal XP',
-            min_value=0, 
-            value=default_w, 
-            key=w_key,
-            on_change=lambda area=a: set_user_config(current_user, f'goal_weekly_{area}', st.session_state[w_key])
-        )
-        m = st.number_input(
-            'Meta mensal XP', 
-            min_value=0, 
-            value=default_m, 
-            key=m_key,
-            on_change=lambda area=a: set_user_config(current_user, f'goal_monthly_{area}', st.session_state[m_key])
-        )
-        goals[a] = {'weekly': w, 'monthly': m}
+        default_note = get_user_config(current_user, f'goal_note_{a}', "")
+        default_daily = int(get_user_config(current_user, f'goal_daily_{a}', 0) or 0)
+
+        # keys para sessão — usa user_keyname (non-None)
+        w_key = f'goal_w_{user_keyname}_{a}'
+        m_key = f'goal_m_{user_keyname}_{a}'
+        note_key = f'goal_note_{user_keyname}_{a}'
+        daily_key = f'goal_daily_{user_keyname}_{a}'
+
+        st.markdown(f"### {a}")
+        col1, col2 = st.columns([2,1])
+
+        with col1:
+            # number_input cria a chave em session_state quando o Streamlit estiver com ScriptRunContext
+            w = st.number_input(
+                'Meta semanal XP',
+                min_value=0,
+                value=default_w,
+                key=w_key,
+                on_change=(lambda area=a, key=w_key: set_user_config(current_user, f'goal_weekly_{area}', st.session_state[key]))
+            )
+            # descrição livre da meta (ex: "Estudar 7 dias na semana - 50xp diários")
+            note = st.text_input(
+                'Descrição detalhada da meta (opcional)',
+                value=default_note,
+                key=note_key,
+                help="Ex: 'Estudar 7 dias na semana - 50xp diários'",
+                on_change=(lambda area=a, key=note_key: set_user_config(current_user, f'goal_note_{area}', st.session_state[key]))
+            )
+
+        with col2:
+            m = st.number_input(
+                'Meta mensal XP',
+                min_value=0,
+                value=default_m,
+                key=m_key,
+                on_change=(lambda area=a, key=m_key: set_user_config(current_user, f'goal_monthly_{area}', st.session_state[key]))
+            )
+            daily = st.number_input(
+                'Sugestão diária (XP) — opcional',
+                min_value=0,
+                value=default_daily,
+                key=daily_key,
+                on_change=(lambda area=a, key=daily_key: set_user_config(current_user, f'goal_daily_{area}', st.session_state[key]))
+            )
+
+        # Segurança ao ler st.session_state: use get() com fallback para evitar KeyError
+        w_val = int(st.session_state.get(w_key, default_w))
+        m_val = int(st.session_state.get(m_key, default_m))
+        note_val = st.session_state.get(note_key, default_note) or ""
+        daily_val = int(st.session_state.get(daily_key, default_daily) or 0)
+
+        # guarda no dicionário local usado depois
+        goals[a] = {'weekly': w_val, 'monthly': m_val, 'note': note_val, 'daily': daily_val}
         st.markdown('---')
+
+# === Metas (UI) ===
+st.header("Metas semanais")
+
+# Carrega metas do usuário (se a função existir)
+try:
+    metas_df = get_metas_for_user(user=current_user)
+except Exception:
+    metas_df = pd.DataFrame()
+
+with st.expander("Criar ou editar meta"):
+    st.write("Defina uma meta semanal por área, descreva-a e (opcional) indique um objetivo diário.")
+    col1, col2 = st.columns([2,1])
+    with col1:
+        meta_area = st.text_input("Área da meta (ex: Educação, Produtividade, Inglês)", key="meta_area_input")
+        meta_note = st.text_area("Descrição / detalhamento (ex: Estudar 7 dias na semana - 50xp diários)", key="meta_note_input")
+    with col2:
+        meta_weekly = st.number_input("Meta semanal (XP total)", min_value=1, step=1, value=350, key="meta_weekly_input")
+        meta_daily = st.number_input("Sugestão diária (XP) — opcional", min_value=0, step=1, value=50, key="meta_daily_input")
+        if st.button("Salvar meta"):
+            try:
+                editing_id = st.session_state.get("editing_meta_id")
+                if editing_id:
+                    # Atualiza meta existente
+                    set_meta(meta_area.strip(), int(meta_weekly), meta_note.strip(), int(meta_daily), user=current_user,
+                             meta_id=int(editing_id))
+                    # limpa flag de edição
+                    del st.session_state["editing_meta_id"]
+                    st.success("Meta atualizada.")
+                else:
+                    # Cria nova meta
+                    set_meta(meta_area.strip(), int(meta_weekly), meta_note.strip(), int(meta_daily), user=current_user)
+                    st.success("Meta criada.")
+                # Mantém user_config sincronizado
+                set_user_config(current_user, f'goal_weekly_{meta_area}', int(meta_weekly))
+                set_user_config(current_user, f'goal_monthly_{meta_area}',
+                                int(get_user_config(current_user, f'goal_monthly_{meta_area}', int(meta_weekly * 4))))
+                set_user_config(current_user, f'goal_note_{meta_area}', meta_note.strip())
+                set_user_config(current_user, f'goal_daily_{meta_area}', int(meta_daily))
+                safe_rerun()
+            except Exception as e:
+                st.error(f"Erro ao salvar meta: {e}")
+
+st.markdown("---")
+st.subheader("Minhas metas")
+if metas_df is None or metas_df.empty:
+    st.info("Nenhuma meta cadastrada.")
+else:
+    for _, m in metas_df.iterrows():
+        mdict = m.to_dict()
+        st.markdown(f"**{mdict['area']}** — Meta semanal: **{mdict['weekly_target']} XP**")
+        if mdict.get('note'):
+            st.write(mdict['note'])
+        # progresso
+        prog = compute_week_progress_for_meta(mdict)
+        # st.progress agora espera valor entre 0 e 1
+        try:
+            pct_meta = float(prog.get('percent', 0.0))
+        except Exception:
+            pct_meta = 0.0
+
+        pct_meta_norm = max(0.0, min(pct_meta / 100.0, 1.0))
+        st.progress(pct_meta_norm)
+        st.write(f"Acumulado esta semana: **{prog['accumulated_xp']} XP** de {prog['weekly_target']} ({prog['percent']}%) — período {prog['start_date'].isoformat()} → {prog['end_date'].isoformat()}")
+        # --- BOTÃO: registrar XP diretamente para esta meta (opcional)
+        # Só aparece se meta tem sugestão diária ou se você quer registrar manualmente
+        try:
+            if int(mdict.get('daily_suggestion', 0)) > 0:
+                if st.button(f"Registrar +{int(mdict['daily_suggestion'])} XP para meta '{mdict['area']}'", key=f"reg_meta_{mdict['id']}"):
+                    add_event(date.today(), mdict['area'], int(mdict['daily_suggestion']),
+                              note=f"Registro direto para meta {mdict['id']}", user=current_user, meta_id=int(mdict['id']))
+                    st.success("Registrado para a meta.")
+                    safe_rerun()
+        except Exception:
+            # fallback: se daily_suggestion não for int/estiver ausente, mostra um botão genérico
+            if st.button(f"Registrar XP para meta '{mdict['area']}'", key=f"reg_meta_fallback_{mdict['id']}"):
+                add_event(date.today(), mdict['area'], 0, note=f"Registro direto para meta {mdict['id']}", user=current_user, meta_id=int(mdict['id']))
+                st.success("Registrado para a meta.")
+                safe_rerun()
+        # opção de transformar daily_suggestion em quest diária
+        if int(mdict.get('daily_suggestion', 0)) > 0:
+            if st.button(f"Criar/Atualizar quest diária ({mdict['daily_suggestion']} XP)", key=f"create_daily_{mdict['id']}"):
+                qid = create_or_update_daily_quest_from_meta(mdict)
+                if qid:
+                    st.success(f"Quest diária criada/atualizada (id {qid}).")
+                    safe_rerun()
+                else:
+                    st.error("Não foi possível criar/atualizar a quest.")
+        # editar / excluir
+        cols = st.columns([1, 1])  # Editar e Excluir
+        with cols[0]:
+            st.button(
+                "Editar",
+                key=f"edit_meta_{mdict['id']}",
+                on_click=start_meta_edit,
+                args=(
+                    mdict['area'],
+                    mdict.get('note') or "",
+                    int(mdict['weekly_target']),
+                    int(mdict.get('daily_suggestion') or 0),
+                    int(mdict['id'])
+                )
+            )
+
+        with cols[1]:
+            if st.button("Excluir", key=f"del_meta_{mdict['id']}"):
+                area_to_clear = mdict['area']
+                meta_id_to_delete = int(mdict['id'])
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=5)
+                    c = conn.cursor()
+                    # 1) Deleta a meta da tabela metas
+                    c.execute("DELETE FROM metas WHERE id=?", (meta_id_to_delete,))
+                    conn.commit()
+
+                    # 2) Remove quests diárias geradas pela meta (se houver)
+                    try:
+                        # procura quests cujo title comece com 'Meta diária: <area>'
+                        pattern = f"Meta diária: {area_to_clear}%"
+                        c.execute("DELETE FROM quests WHERE title LIKE ? AND (user=? OR user IS NULL)",
+                                  (pattern, current_user))
+                        conn.commit()
+                    except Exception:
+                        # se falhar aqui, não bloqueia; log no console
+                        print(f"Aviso: falha ao tentar remover quests diárias para area={area_to_clear}")
+
+                    conn.close()
+
+                    # 3) Limpa user_config relacionado para evitar que a meta "continue aparecendo"
+                    #    — remove descrição, sugestão diária e reseta metas semanais/mensais para defaults
+                    try:
+                        set_user_config(current_user, f'goal_note_{area_to_clear}', "")
+                        set_user_config(current_user, f'goal_daily_{area_to_clear}', 0)
+                        # opcional: resetar metas para valores padrão (ajuste se preferir outros defaults)
+                        set_user_config(current_user, f'goal_weekly_{area_to_clear}', 100)
+                        set_user_config(current_user, f'goal_monthly_{area_to_clear}', 400)
+                    except Exception:
+                        print(f"Aviso: falha ao limpar user_config para area={area_to_clear}")
+
+                    st.success("Meta excluída com sucesso — entradas relacionadas também foram limpas.")
+                    safe_rerun()
+                except Exception as e:
+                    st.error(f"Erro ao excluir meta: {e}")
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
 st.subheader('Progresso nas metas')
 if df.empty:
@@ -706,11 +1389,54 @@ else:
     week_df = df_pd[df_pd['date'] >= week_start]
     month_df = df_pd[df_pd['date'] >= month_start]
 
-    for a in areas: 
+    for a in areas:
         w_xp = int(week_df[week_df['area'] == a]['xp'].sum())
         m_xp = int(month_df[month_df['area'] == a]['xp'].sum())
-        st.write(f"**{a}** — Semana: {w_xp}/{goals[a]['weekly']} | Mês: {m_xp}/{goals[a]['monthly']}")
-        st.progress(min(w_xp / max(1, goals[a]['weekly']), 1.0))
+
+        # usa os valores atualizados em 'goals'
+        weekly_target = int(goals.get(a, {}).get('weekly', int(get_user_config(current_user, f'goal_weekly_{a}', 100))))
+        monthly_target = int(goals.get(a, {}).get('monthly', int(get_user_config(current_user, f'goal_monthly_{a}', 400))))
+        note = goals.get(a, {}).get('note') or get_user_config(current_user, f'goal_note_{a}', "")
+        daily_suggestion = int(goals.get(a, {}).get('daily', get_user_config(current_user, f'goal_daily_{a}', 0) or 0))
+
+        st.markdown(f"### **{a}**")
+        if note:
+            st.write(f"*{note}*")
+        st.write(f"Semana: **{w_xp}** / {weekly_target} XP  —  Mês: **{m_xp}** / {monthly_target} XP")
+        # barra de progresso (protege divisão por zero)
+        if weekly_target > 0:
+            st.progress(min(w_xp / max(1, weekly_target), 1.0))
+            pct = round((w_xp / weekly_target) * 100, 1)
+            st.write(f"{pct}% da meta semanal")
+        else:
+            st.info("Meta semanal não definida")
+
+        # Sugestão diária e botão para criar/atualizar quest diária
+        if daily_suggestion and daily_suggestion > 0:
+            cols = st.columns([2,1])
+            with cols[0]:
+                st.write(f"Sugestão diária: **{daily_suggestion} XP**")
+            with cols[1]:
+                if st.button(f"Criar/Atualizar quest diária ({daily_suggestion} XP) — {a}", key=f"create_daily_cfg_{a}"):
+                    # monta meta_row compatível com create_or_update_daily_quest_from_meta
+                    meta_row = {
+                        'area': a,
+                        'weekly_target': weekly_target,
+                        'note': note,
+                        'daily_suggestion': daily_suggestion,
+                        'user': current_user
+                    }
+                    try:
+                        qid = create_or_update_daily_quest_from_meta(meta_row)
+                        if qid:
+                            st.success(f"Quest diária criada/atualizada (id {qid}).")
+                            safe_rerun()
+                        else:
+                            st.error("Não foi possível criar/atualizar a quest.")
+                    except Exception as e:
+                        st.error(f"Erro ao criar/atualizar quest diária: {e}")
+
+        st.markdown('---')
 
 # Detailed events table
 st.markdown('---')
@@ -790,7 +1516,6 @@ else:
 st.markdown('---')
 st.header('Quests & Streaks')
 with st.expander('Criar nova quest'):
-    # ... (código do formulário 'Criar nova quest' existente)
     q_title = st.text_input('Título da quest', key=f'q_title_{current_user}')
     q_area = st.selectbox('Área', options=areas, key=f'q_area_{current_user}') 
     q_xp = st.number_input('XP recompensa', min_value=0, value=50, key=f'q_xp_{current_user}')
@@ -949,25 +1674,69 @@ if penalize and not quests_df.empty:
     conn.commit()
     conn.close()
 
-# Perks display (user-scoped)
+# --- PAINEL: Níveis por área (mostra XP e Level por área)
+area_totals = compute_area_xp_totals(user=current_user)
+area_levels = {a: level_from_xp(area_totals.get(a, 0)) for a in AREAS_DEFAULT}
+
+st.markdown('---')
+st.subheader("Níveis por área")
+for a in AREAS_DEFAULT:
+    st.write(f"**{a}** — XP: {area_totals.get(a, 0)} → Lv {area_levels.get(a, 1)}")
+
+# Perks display (user-scoped) com contadores regressivos para perks temporais
 st.markdown('---')
 st.header('Perks desbloqueáveis')
 perks_df = load_perks(user=current_user)
 area_xp = aggregate_xp_by_area(df)
 area_levels = {a: level_from_xp(int(area_xp.get(a, 0))) for a in AREAS_DEFAULT}
+
 for _, p in perks_df.iterrows():
     unlocked = False
     area = p['area']
     if not area or pd.isna(area):
-        # Desbloqueio baseado no XP total
         unlocked = level_from_xp(int(df['xp'].sum() if not df.empty else 0)) >= int(p['unlock_level'])
     else:
-        # Desbloqueio baseado em área específica (usa a primeira área listada como requisito)
-        req_area = area.split('/')[0] 
+        req_area = area.split('/')[0]
         unlocked = area_levels.get(req_area, 1) >= int(p['unlock_level'])
-        
+
+    # Informações de tempo/multiplicador
+    dur = int(p.get('duration_days') or 0)
+    mult = float(p.get('multiplier') or 1.0)
+    start = p.get('start_date')
+    is_active_flag = int(p.get('active') or 0)
+
     if unlocked:
-        st.success(f"**{p['name']}** (desbloqueado) — {p['effect']}")
+        col1, col2 = st.columns([4,1])
+        with col1:
+            st.success(f"**{p['name']}** — {p['effect']}")
+            st.write(
+                f"Áreas: {p.get('area') or 'Todas'} | Requisito Lv {p['unlock_level']} | Multiplier: x{float(p.get('multiplier') or 1.0):.2f}")
+            if dur > 0:
+                if is_active_flag:
+                    remaining = perk_time_remaining(p)
+                    st.info(f"Ativa — tempo restante: {remaining}")
+                else:
+                    st.info(f"Duração: {dur} dias (quando ativada)")
+        with col2:
+            # Botão de ativar/desativar (ativa só para perks desbloqueadas)
+            act_key = f"activate_perk_{current_user}_{int(p['id'])}"
+            deact_key = f"deactivate_perk_{current_user}_{int(p['id'])}"
+            if is_active_flag:
+                if st.button("Desativar", key=deact_key):
+                    try:
+                        deactivate_perk(int(p['id']), user=current_user)
+                        st.success("Perk desativada")
+                        safe_rerun()
+                    except sqlite3.OperationalError:
+                        st.error("Erro ao desativar perk: DB bloqueado")
+            else:
+                if st.button("Ativar", key=act_key):
+                    try:
+                        activate_perk(int(p['id']), user=current_user)
+                        st.success("Perk ativada — será aplicada nas próximas atividades registradas")
+                        safe_rerun()
+                    except sqlite3.OperationalError:
+                        st.error("Erro ao ativar perk: DB bloqueado")
     else:
         st.write(f"**{p['name']}** — (Requisito: {area} Lv {p['unlock_level']}) — {p['effect']}")
 
