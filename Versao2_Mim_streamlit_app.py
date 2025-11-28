@@ -1780,6 +1780,7 @@ st.header('Penalidades por quebra de hábito')
 
 # 1) Painel: penalidade automática (missed daily) — conserva o comportamento existente
 with st.expander('Configurar penalidades automáticas'):
+    st.markdown("### Penalidade Diária (Missed Daily Quest)")
     default_penalize_str = get_user_config(current_user, 'penalty_active', 'False')
     default_penalize = default_penalize_str.lower() == 'true'
     default_penalty_amount = int(get_user_config(current_user, 'penalty_amount', 10))
@@ -1795,14 +1796,65 @@ with st.expander('Configurar penalidades automáticas'):
     )
 
     penalty_amount = st.number_input(
-        'XP a subtrair por falta (automática)',
+        'XP a subtrair por falta (diária)',
         min_value=0,
         value=default_penalty_amount,
         key=penalty_amount_key,
         on_change=lambda: set_user_config(current_user, 'penalty_amount', st.session_state[penalty_amount_key])
     )
 
-# Executa a penalidade automática (se ativada)
+    # Penalidades por metas semanais/mensais não atingidas
+    st.markdown("### Penalidades por Metas Não Atingidas (Semanal/Mensal)")
+
+    # Semanal
+    default_penalize_weekly_str = get_user_config(current_user, 'penalty_weekly_active', 'False')
+    default_penalize_weekly = default_penalize_weekly_str.lower() == 'true'
+    # Valor base para a penalidade semanal
+    default_penalty_weekly_amount = int(get_user_config(current_user, 'penalty_weekly_amount', 50)) 
+
+    penalize_weekly_key = f'penalize_weekly_{current_user}'
+    penalty_weekly_amount_key = f'penalty_weekly_amount_{current_user}'
+
+    penalize_weekly = st.checkbox(
+        'Ativar penalidades por **meta semanal** não atingida',
+        value=default_penalize_weekly,
+        key=penalize_weekly_key,
+        on_change=lambda: set_user_config(current_user, 'penalty_weekly_active', st.session_state[penalize_weekly_key])
+    )
+
+    penalty_weekly_amount = st.number_input(
+        'XP a subtrair por meta semanal não atingida (base)',
+        min_value=0,
+        value=default_penalty_weekly_amount,
+        key=penalty_weekly_amount_key,
+        on_change=lambda: set_user_config(current_user, 'penalty_weekly_amount', st.session_state[penalty_weekly_amount_key])
+    )
+
+    # Mensal
+    default_penalize_monthly_str = get_user_config(current_user, 'penalty_monthly_active', 'False')
+    default_penalize_monthly = default_penalize_monthly_str.lower() == 'true'
+    # Valor base para a penalidade mensal
+    default_penalty_monthly_amount = int(get_user_config(current_user, 'penalty_monthly_amount', 100)) 
+
+    penalize_monthly_key = f'penalize_monthly_{current_user}'
+    penalty_monthly_amount_key = f'penalty_monthly_amount_{current_user}'
+
+    penalize_monthly = st.checkbox(
+        'Ativar penalidades por **meta mensal** não atingida',
+        value=default_penalize_monthly,
+        key=penalize_monthly_key,
+        on_change=lambda: set_user_config(current_user, 'penalty_monthly_active', st.session_state[penalize_monthly_key])
+    )
+
+    penalty_monthly_amount = st.number_input(
+        'XP a subtrair por meta mensal não atingida (base)',
+        min_value=0,
+        value=default_penalty_monthly_amount,
+        key=penalty_monthly_amount_key,
+        on_change=lambda: set_user_config(current_user, 'penalty_monthly_amount', st.session_state[penalty_monthly_amount_key])
+    )
+
+# Executa a penalidade automática (missed daily)
 if penalize and 'quests_df' in globals() and not quests_df.empty:
     today = date.today()
     conn = sqlite3.connect(DB_PATH, timeout=5)
@@ -1823,6 +1875,101 @@ if penalize and 'quests_df' in globals() and not quests_df.empty:
                 continue
     conn.commit()
     conn.close()
+
+# Lógica de penalidade por metas não atingidas (Semanal/Mensal)
+def check_and_apply_goal_penalties(user: str):
+    """
+    Verifica se as metas semanais e mensais do período anterior foram atingidas
+    e aplica a penalidade, se ativada.
+    """
+    today = date.today()
+    
+    # --- 1. Penalidade Semanal ---
+    if get_user_config(user, 'penalty_weekly_active', 'False').lower() == 'true':
+        penalty_amount = int(get_user_config(user, 'penalty_weekly_amount', 50))
+        # Verifica se estamos em uma nova semana (segunda-feira) e se a verificação da semana anterior já ocorreu
+        last_weekly_check_str = get_user_config(user, 'last_weekly_penalty_check', '2000-01-01')
+        last_weekly_check = date.fromisoformat(last_weekly_check_str)
+        
+        # O período a ser verificado é a semana anterior
+        # Começo da semana anterior (segunda)
+        prev_week_start = today - timedelta(days=today.weekday() + 7) 
+        # Fim da semana anterior (domingo)
+        prev_week_end = prev_week_start + timedelta(days=6)
+
+        # Só verifica se hoje for uma nova semana (Monday == 0) e a verificação não foi feita nesta semana
+        # Ou se a última checagem foi antes do início da semana anterior.
+        if today.weekday() == 0 and last_weekly_check < today: # Verifica apenas na segunda-feira
+
+            df_prev_week = load_events(user=user)
+            if not df_prev_week.empty:
+                df_prev_week['date'] = pd.to_datetime(df_prev_week['date']).dt.date
+                df_prev_week = df_prev_week[(df_prev_week['date'] >= prev_week_start) & (df_prev_week['date'] <= prev_week_end)]
+            
+            # Checa Metas configuradas via expansor "Configurar metas (por área)"
+            goals_config = {}
+            for area in AREAS_DEFAULT:
+                weekly_target = int(get_user_config(user, f'goal_weekly_{area}', 0))
+                if weekly_target > 0:
+                    goals_config[area] = weekly_target
+            
+            # Agrega XP por área na semana anterior
+            xp_by_area_prev_week = df_prev_week.groupby('area')['xp'].sum() if not df_prev_week.empty else pd.Series(dtype=float)
+            
+            for area, target in goals_config.items():
+                xp_achieved = int(xp_by_area_prev_week.get(area, 0))
+                if xp_achieved < target:
+                    # Aplica a penalidade!
+                    note = f"Penalty Semanal: Meta {area} ({target} XP) não atingida na semana de {prev_week_start.isoformat()} - {prev_week_end.isoformat()}. XP alcançado: {xp_achieved}"
+                    add_event(today, area, -abs(penalty_amount), note=note, type_='penalty_weekly_fail', user=user)
+                    st.toast(f"🚨 Penalidade de -{penalty_amount} XP em {area} por falha na meta semanal.", icon="❌")
+            
+            # Marca a verificação como feita
+            set_user_config(user, 'last_weekly_penalty_check', today.isoformat())
+
+    # --- 2. Penalidade Mensal ---
+    if get_user_config(user, 'penalty_monthly_active', 'False').lower() == 'true':
+        penalty_amount = int(get_user_config(user, 'penalty_monthly_amount', 100))
+        # Verifica se estamos em um novo mês (primeiro dia)
+        last_monthly_check_str = get_user_config(user, 'last_monthly_penalty_check', '2000-01-01')
+        last_monthly_check = date.fromisoformat(last_monthly_check_str)
+        
+        # O período a ser verificado é o mês anterior
+        first_of_month = date(today.year, today.month, 1)
+        prev_month_end = first_of_month - timedelta(days=1)
+        prev_month_start = date(prev_month_end.year, prev_month_end.month, 1)
+
+        # Só verifica se hoje for o primeiro do mês e a verificação não foi feita neste mês
+        if today.day == 1 and last_monthly_check < today:
+
+            df_prev_month = load_events(user=user)
+            if not df_prev_month.empty:
+                df_prev_month['date'] = pd.to_datetime(df_prev_month['date']).dt.date
+                df_prev_month = df_prev_month[(df_prev_month['date'] >= prev_month_start) & (df_prev_month['date'] <= prev_month_end)]
+            
+            # Checa Metas configuradas via expansor "Configurar metas (por área)"
+            goals_config = {}
+            for area in AREAS_DEFAULT:
+                monthly_target = int(get_user_config(user, f'goal_monthly_{area}', 0))
+                if monthly_target > 0:
+                    goals_config[area] = monthly_target
+            
+            # Agrega XP por área no mês anterior
+            xp_by_area_prev_month = df_prev_month.groupby('area')['xp'].sum() if not df_prev_month.empty else pd.Series(dtype=float)
+            
+            for area, target in goals_config.items():
+                xp_achieved = int(xp_by_area_prev_month.get(area, 0))
+                if xp_achieved < target:
+                    # Aplica a penalidade!
+                    note = f"Penalty Mensal: Meta {area} ({target} XP) não atingida no mês de {prev_month_start.isoformat()} - {prev_month_end.isoformat()}. XP alcançado: {xp_achieved}"
+                    add_event(today, area, -abs(penalty_amount), note=note, type_='penalty_monthly_fail', user=user)
+                    st.toast(f"🚨 Penalidade de -{penalty_amount} XP em {area} por falha na meta mensal.", icon="❌")
+            
+            # Marca a verificação como feita
+            set_user_config(user, 'last_monthly_penalty_check', today.isoformat())
+
+# Executa a checagem de metas no início da página
+check_and_apply_goal_penalties(current_user)
 
 st.markdown('---')
 
