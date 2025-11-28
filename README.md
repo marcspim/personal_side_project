@@ -1,61 +1,82 @@
-# Versão 2.0 de Mim — HUD de Vida Gamificado  
-**Status: FASE INICIAL / PROJETO EM DESENVOLVIMENTO**
+# Versão 2.0 de Mim — HUD de Vida Gamificado
 
-Este projeto é um **dashboard pessoal gamificado**, construído em **Streamlit**, que transforma sua rotina em um sistema de progressão de personagem — com **níveis, XP, metas, perks, badges e quests**.  
-Ele funciona como um HUD de RPG aplicado ao mundo real, registrando hábitos, tarefas e evolução em diversas áreas da vida.
+Este projeto é um **dashboard pessoal gamificado**, construído em **Streamlit**, que transforma sua rotina em um sistema de progressão de personagem com **níveis, XP, metas, perks, quests, badges e rastreamento de hábitos**.  
+Ele funciona como um HUD de RPG aplicado ao mundo real, registrando tarefas e evolução em diversas áreas da vida.
 
 ---
 
 ## Objetivo do Projeto
-Criar uma ferramenta simples, intuitiva e divertida para acompanhar desenvolvimento pessoal, usando conceitos de:
+
+Criar uma ferramenta intuitiva e motivadora para acompanhar desenvolvimento pessoal usando conceitos de:
+
 - Gamificação  
+- Habit tracking  
 - Quantified Self  
 - Monitoramento de metas  
-- Habit tracking  
-- Sistemas de progressão estilo RPG  
+- Sistema de progressão estilo RPG  
 
 O projeto ainda está em **fase inicial**, mas já possui várias funcionalidades robustas e um banco de dados local.
 
 ---
 
 ## Tecnologias Utilizadas
+
 - **Python 3.10+**
 - **Streamlit**
-- **SQLite (banco local)**
+- **SQLite**
 - **Pandas / NumPy**
-- **Plotly (gráficos interativos)**
-- **Hashlib (autenticação simples)**
+- **Plotly**
+- **Hashlib**
 - **Pathlib / datetime**
 
 ---
 
-## Principais Funcionalidades
+# Funcionalidades Principais
 
-### Login e Sistema de Usuários
-- Autenticação simples com hash SHA-256  
-- Perfis de usuário independentes  
-- Armazenamento de dados individualizados (eventos, quests, perks, configs)
+## Login e Sistema de Usuários
+- Autenticação com hash SHA-256.  
+- Perfis independentes por usuário.  
+- Armazenamento isolado de eventos, metas, perks, quests e configurações.  
+- Campos adicionais de perfil (bio, profissão, métricas corporais etc.).
 
 ---
 
-### Registro de Atividades (XP)
-- Registro de eventos com:
+## Registro de Atividades (XP)
+- Registro de eventos contendo:
   - Data  
-  - Área (ex: Produtividade, Educação, Saúde, Inglês etc.)  
+  - Área  
   - XP  
+  - Tipo de evento  
   - Notas  
-- Cálculo automático de:
-  - XP total  
-  - Nível atual  
-  - XP necessário para o próximo nível  
-- Progress bars e highlights visuais
+  - Usuário  
+  - Associação opcional a uma meta  
+- Cálculo automático do XP modificado por perks ativas.  
+- Progressão de nível por fórmula exponencial:
+  ```python
+  BASE_XP = 100
+  XP_EXP = 1.45
+  ```
 
 ---
 
-### Visualizações e Métricas
+# Tipos de Evento
+
+Cada evento possui um campo `type`, que classifica sua origem:
+
+- `manual` – evento criado diretamente pelo usuário  
+- `quest` – XP concedido pela conclusão de uma quest  
+- `penalty` – XP negativo gerado automaticamente por penalidades  
+- `meta` – XP inserido automaticamente a partir de metas (ex.: sugestão diária)  
+
+Esse campo é utilizado para auditoria, transparência e análises mais precisas no dashboard.
+
+---
+
+# Visualizações e Métricas
+
 - Gráfico de barras por área  
-- Gráfico radar de equilíbrio de áreas  
-- Evolução de XP ao longo do tempo (Diário/Semanal/Mensal)  
+- Gráfico radar de equilíbrio  
+- XP ao longo do tempo (diário, semanal, mensal)  
 - Tabela completa de eventos  
 - Sistema de badges:
   - +1000 XP  
@@ -65,232 +86,216 @@ O projeto ainda está em **fase inicial**, mas já possui várias funcionalidade
 
 ---
 
-### Metas (por área)
+# Metas (Tabela `metas`)
 
-Metas possuem **persistência própria**, **associação com eventos** e **integração automática com quests diárias**.
+O sistema de metas é totalmente persistente e específico por usuário.
 
-#### Estrutura Interna
-Cada meta é armazenada na tabela `metas` com os campos:
+### Estrutura da Tabela `metas`
 
-- `area` – área à qual a meta pertence  
-- `weekly_target` – XP alvo semanal  
-- `note` – descrição detalhada  
-- `daily_suggestion` – sugestão de XP diário  
-- `created_at` e `updated_at` – controles automáticos  
-- `active` – permite arquivamento sem exclusão definitiva
+| Campo             | Descrição |
+|-------------------|-----------|
+| id                | Identificador |
+| area              | Área da meta |
+| weekly_target     | Meta semanal de XP |
+| note              | Descrição detalhada |
+| daily_suggestion  | Sugestão diária de XP (opcional) |
+| active            | Indica se a meta está ativa |
+| user              | Usuário dono da meta |
+| created_at        | Timestamp de criação |
+| updated_at        | Última atualização |
 
-#### Registro Automático de XP vinculado a metas
-Ao registrar um evento, você pode vinculá-lo diretamente a uma meta.  
-Esse vínculo cria uma relação `events.meta_id`, permitindo:
+### Integração com o Registro de Eventos
+Ao registrar um evento vinculado a uma meta, o campo `meta_id` é preenchido automaticamente.
 
-- cálculo correto da barra de progresso  
-- métricas semanais baseadas na data de criação da meta  
-- rastreamento específico (não misturado ao XP global)
+### Progresso Semanal Automático
+O sistema calcula:
 
-#### Geração automática de Quests diárias
-Se a meta tiver `daily_suggestion > 0`, o sistema cria ou atualiza automaticamente uma **quest diária** baseada nela:
+- intervalo semanal ativo para cada meta  
+- XP acumulado apenas para aquela meta  
+- percentual concluído  
+- barra de progresso normalizada  
 
-- título: `Meta diária: <área>`  
-- XP recompensa: igual à sugestão diária  
-- cadência: diária  
-- streak independente
+### Registro Direto de XP para a Meta
+Cada meta pode exibir um botão que registra XP diretamente:
 
-Comportamento totalmente automatizado.
+- Se a meta possui `daily_suggestion`, esse valor é usado automaticamente
+- O evento criado recebe `type='meta'`
+- O campo `meta_id` é associado corretamente
 
----
-
-### Quests, Streaks e Regras Internas
-
-As quests possuem lógica interna completa.
-
-#### Campos importantes
-
-- `cadence` — diária / semanal / única
-- `last_done` — controla streak
-- `streak` — número de dias/semana consecutivos
-- `active` — permite desativar sem excluir
-- `user` — quests específicas por usuário (ou globais via `NULL`)
-
-#### Cálculo do Streak
-
-Ao completar uma quest:
-- se a última conclusão foi ontem, o streak aumenta
-- senão, reseta para 1
-- atualiza `last_done`
-
-#### Quests globais vs. individuais
-
-Quests com `user=NULL` são consideradas globais:
-visíveis e completáveis por qualquer usuário.
-
-Quests com `user=<username>` são específicas e só aparecem para ele.
+Esse recurso permite cumprir metas diárias de forma rápida e consistente.
 
 ---
 
-### Penalidades
-- Penalidade automática em caso de falhas em hábitos diários  
-- Valor configurável  
-- Subtração de XP gerando eventos de penalidade
+# Penalidades (Tabela `penalties`)
+
+O sistema possui penalidades automáticas para hábitos não cumpridos.
+
+### Estrutura da Tabela `penalties`
+
+| Campo         | Descrição |
+|---------------|-----------|
+| id            | Identificador |
+| name          | Nome da penalidade |
+| area          | Área afetada |
+| amount        | XP subtraído |
+| user          | Usuário |
+| created_at    | Timestamp |
+
+Ao gerar uma penalidade, um evento é criado automaticamente com `type='penalty'` e XP negativo.
 
 ---
 
-### Perks (Desbloqueáveis)
+# Quests, Streaks e Gestão
 
-#### Estrutura do Sistema de Perks
-A tabela `perks` possui colunas avançadas:
+O sistema de quests permite metas diárias, semanais ou únicas, com acompanhamento de streaks e recompensas em XP.
 
-- `multiplier` – multiplicador aplicado ao XP (ex.: 1.10, 1.20)  
-- `duration_days` – duração em dias do efeito  
-- `start_date` – quando a perk foi ativada  
-- `active` – indica se o bônus está valendo  
-- `user` – perks específicas por usuário (ou `NULL` para perks globais)
+### Campos Internos
 
-#### Regras de Ativação
-Ao ativar uma perk:
+| Campo     | Descrição |
+|-----------|-----------|
+| title     | Título da quest |
+| area      | Área relacionada |
+| xp_reward | XP recebido ao concluir |
+| cadence   | Frequência (`daily`, `weekly`, `once`) |
+| last_done | Última conclusão |
+| streak    | Dias/semana consecutivos completos |
+| active    | Quest ativa ou desativada |
+| user      | Usuário dono da quest |
 
-- `start_date` = timestamp atual  
-- `active = 1`  
-- perks expiram automaticamente ao atingir `duration_days`
+### Lógica de Streak
 
-#### Aplicação automática de bônus de XP
-Toda vez que um evento é registrado:
+- Se concluída no dia seguinte ao anterior, o streak aumenta  
+- Caso contrário, reseta para 1  
+- O campo `last_done` é atualizado automaticamente  
 
-1. O sistema identifica perks ativas relevantes à **área** do evento.  
-2. O maior multiplicador disponível é aplicado ao XP.  
-3. A nota da atividade recebe um marcador:  
+### Edição de Quests
+O usuário pode editar:
 
-`[Bônus aplicado: original X → Y XP]`
+- título  
+- área  
+- XP de recompensa  
+- cadência  
+- streak  
 
-Isso garante transparência total do sistema.
+A edição é permitida apenas para:
 
----
+- quests do próprio usuário  
+- quests globais (`user IS NULL`)
 
-### Sistema de XP e Progressão de Nível
+### Exclusão de Quests (Desativação)
+Quests não são removidas definitivamente.  
+A exclusão é feita via:
 
-A progressão de nível não é linear.  
-O app utiliza uma fórmula exponencial para calcular o XP necessário para cada nível:
-
-```python
-BASE_XP = 100
-XP_EXP = 1.45
+```
+active = 0
 ```
 
-#### Consequências dessa fórmula
-
-- níveis ficam progressivamente mais difíceis
-- XP exigido cresce com uma curva suave
-- o dashboard calcula:
-  - nível atual
-  - XP dentro do nível
-  - XP total para o próximo nível
-  - barra de progresso normalizada
-
-Esse comportamento é automático e transparente ao usuário final.
+Isso preserva histórico e impede inconsistência em streaks.
 
 ---
 
-### Edição, Exclusão e Regras de Autorização
+# Sistema de Perks
 
-O app possui ferramentas avançadas para manipulação de dados.
+Perks fornecem multiplicadores temporários de XP por área.
 
-#### Edição de Eventos
+### Destaques do Sistema
 
-É possível editar:
-- `data`
-- `área`
-- `XP`
-- `notas`
+- Perks são específicas por usuário ou globais  
+- Podem expirar após `duration_days`  
+- Aplicam sempre o maior multiplicador ativo  
+- Matching por área é flexível (contains / listas separadas por "/")  
+- O dashboard exibe tempo restante da perk
 
-Com atualização imediata no banco.
+### Campos da Tabela `perks`
 
-#### Exclusão controlada
-
-Eventos podem ser removidos, mas somente quando o usuário:
-- habilita a exclusão manualmente
-- confirma a operação
-
-#### Edição e Exclusão de Metas
-
-Ao excluir uma meta:
-1. A meta é removida da tabela `metas`
-2. Quests diárias vinculadas a ela também são excluídas
-3. Configurações persistentes (`user_config`) são limpas automaticamente
-
-#### Regras de Autorização
-
-Para evitar interferência entre usuários:
-- um usuário só pode editar quests e metas pertencentes a ele
-- quests globais (`user IS NULL`) podem ser editadas, mas não modificam os dados de outro usuário
-- eventos só podem ser editados/excluídos pelo dono
-
-Esse modelo garante isolamento total dos dados pessoais.
+- name  
+- area  
+- unlock_level  
+- effect  
+- user  
+- multiplier  
+- duration_days  
+- start_date  
+- active  
 
 ---
 
-### Importação / Exportação
-- Exportar todos os eventos em CSV  
-- Importar CSV externo  
-- Backup total de dados pessoais
+# Estrutura Completa do Banco de Dados (SQLite)
 
----
+O app cria ou atualiza automaticamente:
 
-## Estrutura do Banco (SQLite)
-O app cria automaticamente as tabelas:
+### Tabelas Principais
 
 - `users`
 - `events`
 - `quests`
 - `perks`
+- `metas`
+- `penalties`
 - `user_config`
 
-Tudo é armazenado localmente em:
+### Colunas Extras Garantidas por Migrações
 
-`versao2_mim.db`
+- `events.meta_id`
+- `perks.multiplier`
+- `perks.duration_days`
+- `perks.start_date`
+- `perks.active`
 
 ---
 
-## ▶️ Como Executar
+# Importação e Exportação
 
-### 1. Instalar dependências
+- Exportação completa de eventos em CSV  
+- Importação de eventos externos  
+- Backup dos dados pessoais do usuário  
+
+---
+
+# Como Executar
+
+Instalar dependências:
 
 ```bash
 pip install streamlit pandas numpy plotly
 ```
 
-### 2. Rodar o app
+Rodar o app:
 
 ```bash
 streamlit run Versao2_Mim_streamlit_app.py
 ```
 
-### 3. Acessar no navegador
+Acessar em:
 
 ```
 http://localhost:8501
 ```
 
-Ou, caso queira permitir acesso na rede local:
-```
-streamlit run Versao2_Mim_streamlit_app.py --server.address 0.0.0.0
-```
+---
 
-## Roadmap
+# Roadmap
 
-- Sistema de XP bônus temporal (buffs de perks)
 - Modo multiplayer (ver progresso de outros usuários)
 - Tema dark/light configurável
 - Notificações push
 - Sistema de "missões longas" com múltiplas etapas
 - Integração com Google Calendar
 
-## Contribuições
+---
+
+# Contribuições
 
 Como ainda está em fase inicial, qualquer sugestão, ideia, melhoria ou PR é muito bem-vinda!
 
-## Licença
+---
 
-A definir. Atualmente, uso pessoal privado.
+# Licença
 
-## Autor
+Uso pessoal privado. Pode ser adaptado conforme necessário.
+
+---
+
+# Autor
 
 Projeto desenvolvido por Marcel Sarcinelli Pimenta, como ferramenta de produtividade gamificada e autoaperfeiçoamento.
