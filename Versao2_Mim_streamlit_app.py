@@ -2092,39 +2092,120 @@ for a in AREAS_DEFAULT:
 # Perks display (user-scoped) com contadores regressivos para perks temporais
 st.markdown('---')
 st.header('Perks desbloqueáveis')
+def _perk_expired(row) -> bool:
+    """Retorna True se a perk tem duration_days>0, start_date definido e já expirou."""
+    try:
+        dur = int(row.get('duration_days') or 0)
+        sd = row.get('start_date')
+        if dur <= 0 or not sd:
+            return False
+        sd_dt = pd.to_datetime(sd).to_pydatetime()
+        return (datetime.now() - sd_dt).days >= dur
+    except Exception:
+        return False
+
+def _auto_deactivate_if_expired(perk_row, user):
+    """Se perk estiver marcada active=1 mas já expirou, força deactivate_perk() e retorna True se desativou."""
+    try:
+        if int(perk_row.get('active') or 0) and _perk_expired(perk_row):
+            try:
+                deactivate_perk(int(perk_row['id']), user=user)
+                return True
+            except Exception:
+                return False
+    except Exception:
+        return False
+    return False
+
+def _next_multiple_of_3(level):
+    if level % 3 == 0:
+        return level
+    return ((level // 3) + 1) * 3
+
 perks_df = load_perks(user=current_user)
 area_xp = aggregate_xp_by_area(df)
+total_xp_all = int(df['xp'].sum()) if not df.empty else 0
+total_level = level_from_xp(total_xp_all)
 area_levels = {a: level_from_xp(int(area_xp.get(a, 0))) for a in AREAS_DEFAULT}
+
+# 1) Auto-deactivate perks que estão active=1 mas já expiraram (corrige DB inconsistente)
+for _, p in perks_df.iterrows():
+    _auto_deactivate_if_expired(p, user=current_user)
+
+# Recarrega para refletir alterações
+perks_df = load_perks(user=current_user)
 
 for _, p in perks_df.iterrows():
     unlocked = False
     area = p['area']
+    # Determina o requisito com base na área da perk (se não definida, usa nível total)
     if not area or pd.isna(area):
-        unlocked = level_from_xp(int(df['xp'].sum() if not df.empty else 0)) >= int(p['unlock_level'])
+        unlocked = total_level >= int(p['unlock_level'])
     else:
         req_area = area.split('/')[0]
         unlocked = area_levels.get(req_area, 1) >= int(p['unlock_level'])
 
-    # Informações de tempo/multiplicador
+    # flags / metadados
     dur = int(p.get('duration_days') or 0)
     mult = float(p.get('multiplier') or 1.0)
     start = p.get('start_date')
     is_active_flag = int(p.get('active') or 0)
 
+    # Regra ESPECIAL apenas para Focus Booster: re-liberação a cada 3 níveis da área relevante
+    is_focus = str(p.get('name') or "").strip().lower() == 'focus booster'
+    focus_allowed_to_activate = True
+    next_lv = None
+    if is_focus:
+        # escolhe o nível relevante: se perk ligada a uma área -> usa level da área; senão, usa level total
+        if not area or pd.isna(area):
+            relevant_level = total_level
+            relevant_area_name = None
+        else:
+            relevant_area_name = area.split('/')[0]
+            relevant_level = area_levels.get(relevant_area_name, 1)
+
+        req_lv = int(p.get('unlock_level') or 0)
+        # se não atingiu o unlock_level base, então ainda não pode
+        if relevant_level < req_lv:
+            focus_allowed_to_activate = False
+            next_lv = req_lv
+        else:
+            # exige múltiplos de 3 do nível **da área relevante**
+            if relevant_level % 3 != 0:
+                focus_allowed_to_activate = False
+                next_lv = _next_multiple_of_3(relevant_level + 1)
+            else:
+                focus_allowed_to_activate = True
+                next_lv = relevant_level
+
+    # Render UI
     if unlocked:
         col1, col2 = st.columns([4,1])
         with col1:
             st.success(f"**{p['name']}** — {p['effect']}")
             st.write(
-                f"Áreas: {p.get('area') or 'Todas'} | Requisito Lv {p['unlock_level']} | Multiplier: x{float(p.get('multiplier') or 1.0):.2f}")
+                f"Áreas: {p.get('area') or 'Todas'} | Requisito Lv {p['unlock_level']} | Multiplier: x{float(p.get('multiplier') or 1.0):.2f}"
+            )
             if dur > 0:
                 if is_active_flag:
                     remaining = perk_time_remaining(p)
-                    st.info(f"Ativa — tempo restante: {remaining}")
+                    if remaining == "Expirada":
+                        st.info("Expirada — será marcada como Desativada automaticamente.")
+                    else:
+                        st.info(f"Ativa — tempo restante: {remaining}")
                 else:
-                    st.info(f"Duração: {dur} dias (quando ativada)")
+                    if is_focus:
+                        if focus_allowed_to_activate:
+                            st.info(f"Duração: {dur} dias (pode ser ativada agora).")
+                        else:
+                            # Mensagem específica informando o próximo nível da área
+                            if not area or pd.isna(area):
+                                st.info(f"Desativada — Focus Booster só pode ser ativada em níveis múltiplos de 3 do nível total. Próximo desbloqueio: nível {next_lv}.")
+                            else:
+                                st.info(f"Desativada — Focus Booster só pode ser ativada em níveis múltiplos de 3 da área '{relevant_area_name}'. Próximo desbloqueio: nível {next_lv}.")
+                    else:
+                        st.info(f"Duração: {dur} dias (quando ativada)")
         with col2:
-            # Botão de ativar/desativar (ativa só para perks desbloqueadas)
             act_key = f"activate_perk_{current_user}_{int(p['id'])}"
             deact_key = f"deactivate_perk_{current_user}_{int(p['id'])}"
             if is_active_flag:
@@ -2136,13 +2217,26 @@ for _, p in perks_df.iterrows():
                     except sqlite3.OperationalError:
                         st.error("Erro ao desativar perk: DB bloqueado")
             else:
-                if st.button("Ativar", key=act_key):
-                    try:
-                        activate_perk(int(p['id']), user=current_user)
-                        st.success("Perk ativada — será aplicada nas próximas atividades registradas")
-                        safe_rerun()
-                    except sqlite3.OperationalError:
-                        st.error("Erro ao ativar perk: DB bloqueado")
+                show_activate = True
+                if is_focus and not focus_allowed_to_activate:
+                    show_activate = False
+
+                if show_activate:
+                    if st.button("Ativar", key=act_key):
+                        try:
+                            activate_perk(int(p['id']), user=current_user)
+                            st.success("Perk ativada — será aplicada nas próximas atividades registradas")
+                            safe_rerun()
+                        except sqlite3.OperationalError:
+                            st.error("Erro ao ativar perk: DB bloqueado")
+                else:
+                    # botão bloqueado/indisponível — mostre explicação
+                    st.write("")  # placeholder para alinhamento
+                    if is_focus:
+                        if not area or pd.isna(area):
+                            st.warning(f"Bloqueada: disponível somente no nível total múltiplo de 3. Próximo: {next_lv} (você: {total_level}).")
+                        else:
+                            st.warning(f"Bloqueada: disponível somente no nível múltiplo de 3 da área '{relevant_area_name}'. Próximo: {next_lv} (você: {area_levels.get(relevant_area_name, 0)}).")
     else:
         st.write(f"**{p['name']}** — (Requisito: {area} Lv {p['unlock_level']}) — {p['effect']}")
 
